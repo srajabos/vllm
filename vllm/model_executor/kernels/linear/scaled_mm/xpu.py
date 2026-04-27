@@ -6,6 +6,7 @@ from collections.abc import Sequence
 import torch
 
 from vllm.model_executor.kernels.linear import (  # noqa: E501
+    Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
     FP8ScaledMMLinearLayerConfig,
 )
@@ -70,3 +71,46 @@ class XPUFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         output_shape: list,
     ) -> torch.Tensor:
         pass
+
+
+class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
+    """XPU fallback: dequantize block-scaled FP8 weights to BF16 on load,
+    then run standard BF16 matmul."""
+
+    apply_input_quant = False
+
+    @classmethod
+    def is_supported(cls, compute_capability=None):
+        if not current_platform.is_xpu():
+            return False, "XPUFp8BlockScaledMM only supported on XPU"
+        return True, None
+
+    @classmethod
+    def can_implement(cls, config):
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        params = self._get_layer_params(layer)
+        weight = params.weight  # FP8 [out, in]
+        weight_scale = (
+            params.weight_scale
+            if params.weight_scale_inv is None
+            else params.weight_scale_inv
+        )
+        out_f, in_f = weight.shape
+        gs = self.weight_group_shape
+        block_out, block_in = int(gs[0]), int(gs[1])
+        ws = weight_scale.to(torch.float32)
+        ws_expanded = ws.repeat_interleave(block_out, dim=0)[:out_f]
+        ws_expanded = ws_expanded.repeat_interleave(block_in, dim=1)[:, :in_f]
+        weight_bf16 = (weight.to(torch.float32) * ws_expanded).to(torch.bfloat16)
+        replace_parameter(layer, params.WEIGHT, weight_bf16)
+
+    def apply_weights(self, layer, x, bias=None, **kwargs):
+        weight = layer.weight  # BF16 [out, in]
+        out = torch.nn.functional.linear(x.to(weight.dtype), weight, bias)
+        return out.to(self.config.out_dtype)
+
+    def apply_block_scaled_mm(self, A, B, As, Bs):
+        raise NotImplementedError

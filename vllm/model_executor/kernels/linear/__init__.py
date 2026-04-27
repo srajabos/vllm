@@ -136,6 +136,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.triton import (
 )
 from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
     XPUFP8ScaledMMLinearKernel,
+    XPUFp8BlockScaledMMKernel,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import PlatformEnum, current_platform
@@ -190,6 +191,9 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum.ROCM: [
         AiterFp8BlockScaledMMKernel,
         TritonFp8BlockScaledMMKernel,
+    ],
+    PlatformEnum.XPU: [
+        XPUFp8BlockScaledMMKernel,
     ],
 }
 
