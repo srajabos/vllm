@@ -74,8 +74,7 @@ class XPUFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
 
 class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
-    """XPU fallback: dequantize block-scaled FP8 weights to BF16 on load,
-    then run standard BF16 matmul."""
+    """XPU blockwise FP8 w8a16 kernel backed by fp8_gemm_w8a16."""
 
     apply_input_quant = False
 
@@ -87,29 +86,24 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
     @classmethod
     def can_implement(cls, config):
+        if not (hasattr(torch.ops, "_xpu_C") and hasattr(torch.ops._xpu_C, "fp8_gemm_w8a16")):
+            return False, "fp8_gemm_w8a16 op is unavailable"
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
         params = self._get_layer_params(layer)
-        weight = params.weight  # FP8 [out, in]
+        # fp8_gemm_w8a16 expects weight in [in, out]
+        replace_parameter(layer, params.WEIGHT, params.weight.data.t())
+
+    def apply_weights(self, layer, x, bias=None, **kwargs):
+        params = self._get_layer_params(layer)
         weight_scale = (
             params.weight_scale
             if params.weight_scale_inv is None
             else params.weight_scale_inv
         )
-        out_f, in_f = weight.shape
-        gs = self.weight_group_shape
-        block_out, block_in = int(gs[0]), int(gs[1])
-        ws = weight_scale.to(torch.float32)
-        ws_expanded = ws.repeat_interleave(block_out, dim=0)[:out_f]
-        ws_expanded = ws_expanded.repeat_interleave(block_in, dim=1)[:, :in_f]
-        weight_bf16 = (weight.to(torch.float32) * ws_expanded).to(torch.bfloat16)
-        replace_parameter(layer, params.WEIGHT, weight_bf16)
-
-    def apply_weights(self, layer, x, bias=None, **kwargs):
-        weight = layer.weight  # BF16 [out, in]
-        out = torch.nn.functional.linear(x.to(weight.dtype), weight, bias)
+        out = torch.ops._xpu_C.fp8_gemm_w8a16(x, params.weight, weight_scale, bias)
         return out.to(self.config.out_dtype)
 
     def apply_block_scaled_mm(self, A, B, As, Bs):
