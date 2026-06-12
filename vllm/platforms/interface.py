@@ -646,6 +646,45 @@ class Platform:
                 cache_config.block_size,
             )
 
+        # block_size is a protocol parameter that must agree between Prefill
+        # and Decode workers when KV cache is transferred via NIXL, regardless
+        # of each side's tensor-parallel size. mamba_page_size and
+        # attn_page_size_1_token are both TP-local; when total_kv_heads <
+        # tp_size (severe GQA, e.g. Qwen3-Next with 2 KV heads and TP=4),
+        # get_num_kv_heads() clamps to max(1, ...) and their ratio differs
+        # across TP configurations. Scale both to TP-independent totals
+        # ONLY when the NIXL connector is active, so aggregated serving and
+        # non-NIXL deployments keep the original TP-local sizing and are
+        # unaffected. All downstream uses (padding, assert,
+        # mamba_page_size_padded) still use the local TP-sharded values.
+        def _is_nixl_kv_connector_active(cfg) -> bool:
+            ktc = getattr(cfg, "kv_transfer_config", None)
+            if ktc is None or ktc.kv_connector is None:
+                return False
+            if ktc.kv_connector == "NixlConnector":
+                return True
+            # NixlConnector may be wrapped inside a MultiConnector.
+            if ktc.kv_connector == "MultiConnector":
+                for child in ktc.kv_connector_extra_config.get("connectors", []):
+                    if child.get("kv_connector") == "NixlConnector":
+                        return True
+            return False
+
+        if _is_nixl_kv_connector_active(vllm_config):
+            _tp = parallel_config.tensor_parallel_size
+            _local_kv = model_config.get_num_kv_heads(parallel_config)
+            _total_kv = model_config.get_total_num_kv_heads()
+            _eff_mamba_page = mamba_page_size * _tp
+            _eff_attn_1token = attn_page_size_1_token * _total_kv // _local_kv
+            logger.info(
+                "NIXL KV connector detected: using TP-independent page sizes "
+                "for hybrid block_size derivation (tp=%d, total_kv=%d, "
+                "local_kv=%d).", _tp, _total_kv, _local_kv,
+            )
+        else:
+            _eff_mamba_page = mamba_page_size
+            _eff_attn_1token = attn_page_size_1_token
+
         if cache_config.mamba_cache_mode == "all":
             # With prefix caching, align to mamba chunk size for kernel perf
             # TODO(tdoublep): this constraint can be relaxed fairly
@@ -653,7 +692,7 @@ class Platform:
             # mamba2 kernels.
             base_chunk_size = mamba_block_size or model_config.get_mamba_chunk_size()
             assert base_chunk_size is not None
-            attn_tokens_per_mamba_state = cdiv(mamba_page_size, attn_page_size_1_token)
+            attn_tokens_per_mamba_state = cdiv(_eff_mamba_page, _eff_attn_1token)
             chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
             attn_block_size = chunk_size * cdiv(attn_tokens_per_mamba_state, chunk_size)
             cache_config.mamba_block_size = attn_block_size
@@ -661,8 +700,8 @@ class Platform:
             # Without prefix caching, use minimum block size that satisfies
             # both backend alignment and mamba page size compatibility
             attn_block_size = kernel_block_alignment_size * cdiv(
-                mamba_page_size,
-                kernel_block_alignment_size * attn_page_size_1_token,
+                _eff_mamba_page,
+                kernel_block_alignment_size * _eff_attn_1token,
             )
 
         if cache_config.block_size < attn_block_size:
